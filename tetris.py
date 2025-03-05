@@ -3,40 +3,24 @@ import random
 from colors import Colors
 from block import Block
 from tetris_ai import TetrisAI
-from tetris_dqn import TetrisTrainer
 from config import Config
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import numpy as np
-import torch
-
-# CUDA Diagnostics
-print("CUDA Diagnostics:")
-print(f"CUDA is available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"Current CUDA device: {torch.cuda.current_device()}")
-    print(f"CUDA device name: {torch.cuda.get_device_name()}")
-else:
-    print("Possible reasons CUDA is not available:")
-    print("1. No NVIDIA GPU detected")
-    print("2. CUDA toolkit not installed")
-    print("3. Wrong PyTorch version (CPU-only version installed)")
 
 class TetrisRenderer:
     def __init__(self, screen, game):
         self.screen = screen
         self.game = game
         self.font = pygame.font.Font(None, 36)
-        self.training_surface = None
 
     def draw_frame(self):
         self.screen.fill(Colors.BLACK)
         
-        if not self.game.training or self.game.trainer.episodes_completed % 100 == 0:
-            self.draw_grid()
-            self.draw_current_block()
-            self.draw_next_block()
+        self.draw_grid()
+        self.draw_current_block()
+        self.draw_next_block()
         
         self.draw_ui()
         
@@ -128,47 +112,33 @@ class TetrisRenderer:
             text_surface = self.font.render(text, True, Colors.WHITE)
             self.screen.blit(text_surface, (left_margin, y_pos))
 
-        if self.game.training:
-            self.draw_training_progress()
-
     def _get_info_items(self):
-        info_items = [
-            f"Score: {self.game.score}",
-            f"Level: {self.game.level}",
-            f"Lines: {self.game.lines_cleared_total}",
-            f"High Score: {self.game.high_score}",
-            "",
+        items = [
             "Controls:",
-            "LEFT   Move Left",
-            "RIGHT  Move Right",
-            "UP     Rotate",
-            "DOWN   Drop faster",
-            "SPACE  Drop instantly",
-            "P      Pause",
-            "ESC    Exit",
-            "A      Autoplay",
-            "T      Training Mode"
+            "←→     Move Block",
+            "↑       Rotate Block",
+            "↓       Speed Up",
+            "SPACE   Hard Drop",
+            "P       Pause Game",
+            "ESC     Quit Game",
+            "A       AI Mode"
         ]
         
-        if self.game.training:
-            stats = self.game.trainer.training_stats
-            current_episode = self.game.trainer.episodes_completed
-            max_score = stats.get('max_score', 0)
-            avg_score = stats['avg_scores'][-1] if stats['avg_scores'] else 0
-            
-            info_items.extend([
-                "",
-                "Training Status:",
-                f"Episode: {current_episode}/{self.game.trainer.training_episodes}",
-                f"Progress: {(current_episode/self.game.trainer.training_episodes)*100:.1f}%",
-                f"Current Score: {self.game.score}",
-                f"Max Score: {max_score}",
-                f"Avg Score: {avg_score:.1f}",
-                "",
-                "Press T to Stop Training"
-            ])
+        items.extend([
+            "",
+            "Game Info:",
+            f"Level: {self.game.level}",
+            f"Score: {self.game.score}",
+            f"Lines: {self.game.lines_cleared}",
+            f"High Score: {self.game.high_score}"
+        ])
         
-        return info_items
+        if self.game.ai_enabled:
+            items.append("AI Mode: ON")
+        else:
+            items.append("AI Mode: OFF")
+        
+        return items
 
     def draw_game_over(self):
         overlay = pygame.Surface((Config.WINDOW_WIDTH, Config.WINDOW_HEIGHT))
@@ -227,100 +197,155 @@ class TetrisRenderer:
         resume_rect = resume_text.get_rect(center=(Config.WINDOW_WIDTH // 2, Config.WINDOW_HEIGHT // 2 + 50))
         self.screen.blit(resume_text, resume_rect)
 
-    def draw_training_progress(self):
-        if not self.training_surface:
-            self.training_surface = pygame.Surface((400, 300))
-        
-        fig = Figure(figsize=(4, 3), dpi=100)
-        canvas = FigureCanvasAgg(fig)
-        
-        ax1 = fig.add_subplot(211)
-        ax2 = fig.add_subplot(212)
-        
-        episodes = self.game.trainer.training_stats['episodes']
-        scores = self.game.trainer.training_stats['scores']
-        avg_scores = self.game.trainer.training_stats['avg_scores']
-        
-        if episodes:
-            ax1.plot(episodes, scores, 'b-', alpha=0.3, label='Score')
-            ax1.plot(episodes, avg_scores, 'r-', label='Avg Score')
-            ax1.set_title('Training Scores')
-            ax1.legend(loc='upper left')
-            ax1.grid(True, alpha=0.3)
-            
-            progress = (self.game.trainer.episodes_completed / self.game.trainer.training_episodes) * 100
-            ax2.barh(['Progress'], [progress], color='green')
-            ax2.barh(['Progress'], [100], color='gray', alpha=0.3)
-            ax2.set_xlim(0, 100)
-            ax2.set_title(f'Training Progress: {progress:.1f}%')
-        
-        fig.tight_layout()
-        canvas.draw()
-        
-        buf = np.asarray(canvas.buffer_rgba())
-        buf = buf[:, :, :3]
-        surf = pygame.surfarray.make_surface(buf.swapaxes(0, 1))
-        
-        if surf.get_size() != (400, 300):
-            surf = pygame.transform.scale(surf, (400, 300))
-        
-        self.screen.blit(surf, (700, 50))
-
 class TetrisGame:
     def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((Config.WINDOW_WIDTH, Config.WINDOW_HEIGHT))
+        pygame.display.set_caption("Tetris with AI")
+        self.clock = pygame.time.Clock()
+        self.renderer = TetrisRenderer(self.screen, self)
+        self.reset_game()
+        
+    def reset_game(self):
+        # Initialize game area rectangle
         self.game_area = pygame.Rect(
-            Config.GAME_AREA_LEFT,
-            Config.GAME_AREA_TOP,
-            Config.GRID_WIDTH * Config.GRID_SIZE,
+            Config.GAME_AREA_LEFT, 
+            Config.GAME_AREA_TOP, 
+            Config.GRID_WIDTH * Config.GRID_SIZE, 
             Config.GRID_HEIGHT * Config.GRID_SIZE
         )
         
+        # Initialize game state
         self.grid = [[0 for _ in range(Config.GRID_WIDTH)] for _ in range(Config.GRID_HEIGHT)]
-        self.current_block = None
-        self.next_blocks = []  # List to hold next blocks
+        self.current_block = Block()
+        self.next_blocks = [Block() for _ in range(Config.PREVIEW_BLOCKS)]
         self.game_over = False
         self.paused = False
-        self.score = 0
-        self.high_score = self.load_high_score()
-        self.level = 1
-        self.lines_cleared_total = 0
-        self.fall_speed = 1000
-        self.fall_time = 0
-        self.last_fall_time = pygame.time.get_ticks()
-        self.autoplay = False
         self.ai = TetrisAI()
-        self.move_delay = 0
-        self.last_move_time = 0
-        self.trainer = TetrisTrainer(device=Config.DEVICE)
-        self.training = False
-        self.training_episodes = Config.TRAINING_EPISODES
-        self.training_progress = 0
+        self.ai_enabled = False
         
-        self.reset()
-
-    def reset(self):
-        self.grid = [[0 for _ in range(Config.GRID_WIDTH)] for _ in range(Config.GRID_HEIGHT)]
-        self.current_block = None
-        self.next_blocks = []
-        self.game_over = False
-        self.paused = False
+        # Game metrics
         self.score = 0
         self.level = 1
-        self.lines_cleared_total = 0
-        self.fall_speed = 1000
-        self.fall_time = 0
-        self.last_fall_time = pygame.time.get_ticks()
-        self.autoplay = False
-        self.move_delay = 0
-        self.last_move_time = 0
-
-    def new_block(self):
-        if not self.next_blocks:
-            # Initialize with the configured number of preview blocks if empty
-            self.next_blocks = [Block() for _ in range(Config.PREVIEW_BLOCKS)]
+        self.lines_cleared = 0
+        self.high_score = self.load_high_score()
         
-        self.current_block = self.next_blocks.pop(0)
-        self.next_blocks.append(Block())  # Add new block to end
+        # Game timing
+        self.drop_speed = 500  # ms
+        self.gravity_timer = 0
+        self.move_delay = 100  # ms
+        self.move_timer = 0
+        
+    def handle_input(self, event):
+        if event.type == pygame.KEYDOWN:
+            # Game control keys
+            if event.key == pygame.K_ESCAPE:
+                self.save_high_score()
+                return True  # Signal to exit the game
+                
+            if event.key == pygame.K_p and not self.game_over:
+                self.paused = not self.paused
+                
+            if event.key == pygame.K_a:
+                # Toggle AI
+                self.ai_enabled = not self.ai_enabled
+                
+            if event.key == pygame.K_r and self.game_over:
+                self.save_high_score()
+                self.reset_game()
+                
+            # Block movement and rotation (only if game is active)
+            if not self.paused and not self.game_over and not self.ai_enabled:
+                if event.key == pygame.K_LEFT:
+                    self.move_block(-1, 0)
+                elif event.key == pygame.K_RIGHT:
+                    self.move_block(1, 0)
+                elif event.key == pygame.K_DOWN:
+                    self.move_block(0, 1)
+                elif event.key == pygame.K_UP:
+                    self.rotate_block()
+                elif event.key == pygame.K_SPACE:
+                    # Hard drop
+                    while self.is_valid_position():
+                        self.current_block.y += 1
+                    self.current_block.y -= 1
+                    self.move_block(0, 1)
+                    
+        return False
+
+    def game_loop(self):
+        running = True
+        last_time = pygame.time.get_ticks()
+        
+        while running:
+            current_time = pygame.time.get_ticks()
+            dt = current_time - last_time
+            last_time = current_time
+            
+            # Process events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    break
+                if self.handle_input(event):
+                    running = False
+                    break
+            
+            if not running:
+                break
+                
+            if self.game_over or self.paused:
+                self.renderer.draw_frame()
+                continue
+            
+            # AI move if enabled
+            if self.ai_enabled and not self.game_over:
+                self.apply_ai_move()
+            
+            # Update game state
+            self.update(dt)
+            
+            # Draw the frame
+            self.renderer.draw_frame()
+            
+            # Cap frame rate
+            self.clock.tick(Config.FPS)
+        
+        # Save high score before quitting
+        self.save_high_score()
+        pygame.quit()
+
+    def load_high_score(self):
+        try:
+            with open('highscore.txt', 'r') as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, ValueError):
+            with open('highscore.txt', 'w') as f:
+                f.write('0')
+            return 0
+            
+    def save_high_score(self):
+        try:
+            # Update high score if current score is higher
+            if self.score > self.high_score:
+                self.high_score = self.score
+            
+            # Always write the current high score to file
+            with open('highscore.txt', 'w') as f:
+                f.write(str(self.high_score))
+        except Exception as e:
+            print(f"Error saving high score: {e}")
+
+    def update(self, dt):
+        if self.paused or self.game_over:
+            return
+
+        self.gravity_timer += dt
+        if self.gravity_timer >= self.drop_speed:
+            self.move_block(0, 1)
+            self.gravity_timer = 0
+
+        self.high_score = max(self.score, self.high_score)
 
     def move_block(self, dx, dy):
         if not self.current_block:
@@ -337,17 +362,7 @@ class TetrisGame:
                 self.clear_lines()
                 self.new_block()
                 if not self.is_valid_position():
-                    # Only set game_over if not in training mode
-                    # In training mode, we want to continue and learn from mistakes
-                    if not self.training:
-                        self.game_over = True
-                    else:
-                        # In training mode, just clear the top rows to make space
-                        # This allows the agent to continue learning
-                        self.clear_top_rows(4)  # Clear top 4 rows to make space
-                        # Move the current block up to ensure it's in a valid position
-                        while not self.is_valid_position() and self.current_block.y > 0:
-                            self.current_block.y -= 1
+                    self.game_over = True
             return False
         return True
 
@@ -394,25 +409,27 @@ class TetrisGame:
                 y -= 1
                 
         if lines_cleared > 0:
-            self.lines_cleared_total += lines_cleared
-            self.level = (self.lines_cleared_total // 10) + 1
+            self.lines_cleared += lines_cleared
+            self.level = (self.lines_cleared // 10) + 1
             
             points = {1: 40, 2: 100, 3: 300, 4: 1200}
             self.score += points.get(lines_cleared, 0) * self.level
 
-    def handle_autoplay(self, current_time):
-        if not self.autoplay or self.paused or self.game_over:
-            return
-
-        if current_time - self.last_move_time < self.move_delay:
-            return
+    def new_block(self):
+        if not self.next_blocks:
+            # Initialize with the configured number of preview blocks if empty
+            self.next_blocks = [Block() for _ in range(Config.PREVIEW_BLOCKS)]
         
+        self.current_block = self.next_blocks.pop(0)
+        self.next_blocks.append(Block())  # Add new block to end
+
+    def apply_ai_move(self):
+        """Apply the best move as determined by the AI"""
         try:
             # Get best move from AI
             best_move = self.ai.get_best_move(self, self.current_block, self.next_blocks)
             
             if best_move is None:
-                print("AI couldn't find a valid move")
                 return
                 
             rotation, dx = best_move
@@ -446,136 +463,11 @@ class TetrisGame:
                 self.current_block.x = original_x
                 self.current_block.y = original_y
                 self.current_block.shape = original_shape
-            
-            self.last_move_time = current_time
-            self.move_delay = 50  # Faster autoplay speed
-            
+                
         except Exception as e:
-            print(f"Error in autoplay: {e}")
-            self.autoplay = False
-
-    def load_high_score(self):
-        try:
-            with open('highscore.txt', 'r') as f:
-                return int(f.read().strip())
-        except (FileNotFoundError, ValueError):
-            with open('highscore.txt', 'w') as f:
-                f.write('0')
-            return 0
-            
-    def save_high_score(self):
-        try:
-            # Update high score if current score is higher
-            if self.score > self.high_score:
-                self.high_score = self.score
-            
-            # Always write the current high score to file
-            with open('highscore.txt', 'w') as f:
-                f.write(str(self.high_score))
-        except Exception as e:
-            print(f"Error saving high score: {e}")
-
-    def update(self, current_time):
-        if self.paused or self.game_over:
-            return
-
-        delta_time = current_time - self.last_fall_time
-        self.fall_speed = max(50, 1000 - (self.level * 50))
-
-        if delta_time >= self.fall_speed:
-            self.move_block(0, 1)
-            self.last_fall_time = current_time
-
-        self.high_score = max(self.score, self.high_score)
-
-    def clear_top_rows(self, num_rows):
-        """Clear the top rows to make space during training"""
-        for i in range(min(num_rows, Config.GRID_HEIGHT)):
-            self.grid[i] = [0 for _ in range(Config.GRID_WIDTH)]
-
-class Tetris:
-    def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((Config.WINDOW_WIDTH, Config.WINDOW_HEIGHT))
-        pygame.display.set_caption("Tetris")
-        self.clock = pygame.time.Clock()
-        
-        self.game = TetrisGame()
-        self.renderer = TetrisRenderer(self.screen, self.game)
-
-    def _handle_keydown(self, key):
-        if key == pygame.K_ESCAPE:
-            self.game.save_high_score()
-            if self.game.training:
-                self.game.trainer.save_model()
-            return True
-        if key == pygame.K_r and self.game.game_over:
-            self.game.save_high_score()
-            self.game.reset()
-            self.game.new_block()
-        if key == pygame.K_p and not self.game.game_over:
-            self.game.paused = not self.game.paused
-        if key == pygame.K_a and not self.game.game_over:
-            self.game.autoplay = not self.game.autoplay
-        if not self.game.paused and not self.game.game_over:
-            if key == pygame.K_LEFT:
-                self.game.move_block(-1, 0)
-            elif key == pygame.K_RIGHT:
-                self.game.move_block(1, 0)
-            elif key == pygame.K_DOWN:
-                self.game.move_block(0, 1)
-            elif key == pygame.K_UP:
-                self.game.rotate_block()
-            elif key == pygame.K_SPACE:
-                while self.game.is_valid_position():
-                    self.game.current_block.y += 1
-                self.game.current_block.y -= 1
-                self.game.move_block(0, 1)
-        if key == pygame.K_t and not self.game.game_over:
-            self.game.training = not self.game.training
-            if self.game.training:
-                self.game.trainer.set_training_episodes(self.game.training_episodes)
-        return False
-
-    def run(self):
-        self.game.new_block()
-        
-        try:
-            while True:
-                current_time = pygame.time.get_ticks()
-                self.clock.tick(Config.FPS)
-
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        self.game.save_high_score()
-                        if self.game.training:
-                            self.game.trainer.save_model()
-                        return
-                    if event.type == pygame.KEYDOWN:
-                        if self._handle_keydown(event.key):
-                            return
-
-                # Handle training mode separately from normal gameplay
-                if self.game.training and not self.game.paused:
-                    # Let the trainer handle everything during training
-                    self.game.trainer.train_step(self.game)
-                    
-                    # Only render occasionally to speed up training
-                    if self.game.trainer.episodes_completed % 100 == 0 or self.game.trainer.current_step % 1000 == 0:
-                        self.renderer.draw_frame()
-                    
-                    # Skip the rest of the game loop during training
-                    continue
-
-                # Normal gameplay (non-training)
-                self.game.handle_autoplay(current_time)
-                self.game.update(current_time)
-                self.renderer.draw_frame()
-
-        finally:
-            if self.game.training:
-                self.game.trainer.save_model()
+            print(f"Error in AI move: {e}")
+            self.ai_enabled = False
 
 if __name__ == "__main__":
-    game = Tetris()
-    game.run() 
+    game = TetrisGame()
+    game.game_loop() 
